@@ -1,11 +1,10 @@
 ####################################################################################
 # SAAM Project 2026 - Part I
-# DATA CLEANING / PRE-PROCESSING
+# DATA CLEANING
 # Group: North America + Europe, Scope 1
 ####################################################################################
 
 from pathlib import Path
-import re
 import numpy as np
 import pandas as pd
 
@@ -29,12 +28,6 @@ RI_FILE = "DS_RI_T_USD_M_2025.csv"
 MV_FILE = "DS_MV_T_USD_M_2025.csv"
 CO2_FILE = "DS_CO2_SCOPE_1_Y_2025.csv"
 REV_FILE = "DS_REV_Y_2025.csv"
-
-STALE_THRESHOLD = 0.50
-MIN_VALID_MONTHS = 36           # 3 years of monthly returns
-WINDOW_YEARS = 10
-START_SCREEN_YEAR = 2013
-END_SCREEN_YEAR = 2024
 
 ####################################################################################
 # 2. HELPER FUNCTIONS
@@ -80,7 +73,7 @@ def sort_year_cols(cols):
 
 def drop_empty_timeseries_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Drop rows where all time columns are missing.
+    Drops rows where all time columns are missing.
     """
     df = clean_headers(df)
     _, isin_col = get_id_cols(df)
@@ -100,7 +93,7 @@ def keep_isins(df: pd.DataFrame, valid_isins: set) -> pd.DataFrame:
 def annual_forward_fill(df: pd.DataFrame) -> pd.DataFrame:
     """
     Fill missing annual values using previous year only.
-    Fills missing values in the middle/end, but not at the beginning.
+    This fills missing values in the middle/end, but not at the beginning.
     """
     out = df.copy()
     year_cols = sort_year_cols(get_time_cols(out))
@@ -111,14 +104,15 @@ def annual_forward_fill(df: pd.DataFrame) -> pd.DataFrame:
 
 def detect_delisting(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Detect delisted firms from NAME column and set RI prices to 0
-    from delisting date onward where possible.
+    Detect delisted firms from NAME column and set prices to 0
+    from delisting date onward.
 
-    Case 1:
-      explicit date in name, e.g. "... DELIST 15/09/2008"
-    Case 2:
-      'DEAD' in name with no date -> set first month after last valid price to 0
+    Two cases handled:
+      1. Name contains a date: "COMPANY DELIST 15/09/2008" -> price=0 from that date
+      2. Name contains "DEAD" but no date -> price=0 at first month after last valid price
     """
+    import re
+
     out = df.copy()
     name_col, _ = get_id_cols(out)
     if name_col is None:
@@ -133,45 +127,42 @@ def detect_delisting(df: pd.DataFrame) -> pd.DataFrame:
     for idx in out.index:
         name = str(out.at[idx, name_col])
 
-        # explicit delisting date
+        # Case 1: explicit delisting date in name
         match = delist_pattern.search(name)
         if match:
             try:
                 delist_dt = pd.to_datetime(match.group(1), dayfirst=True)
             except Exception:
                 continue
-
             for c, cdt in zip(month_cols, month_dts):
                 if pd.notna(cdt) and cdt >= delist_dt:
                     out.at[idx, c] = 0.0
 
-        # DEAD without date
+        # Case 2: "DEAD" with no explicit date
         elif dead_pattern.search(name):
             vals = out.loc[idx, month_cols]
             last_valid = vals.last_valid_index()
-            if last_valid is not None:
-                last_pos = month_cols.index(last_valid)
-                if last_pos + 1 < len(month_cols):
-                    out.at[idx, month_cols[last_pos + 1]] = 0.0
+            if last_valid is not None and last_valid != month_cols[-1]:
+                pos = month_cols.index(last_valid) + 1
+                out.at[idx, month_cols[pos]] = 0.0
 
     return out
 
 
 def compute_monthly_returns(ri_prices: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute simple returns from cleaned RI prices.
-
-    Rules:
-    - standard return if P_t and P_{t-1} are both > 0
-    - if P_t == 0 and P_{t-1} > 0, set return = -1.0
-    - otherwise leave as NaN
+    Compute simple monthly returns from cleaned RI prices.
+    Handles:
+      - standard return: R_t = P_t / P_{t-1} - 1
+      - delisting (price == 0 with valid previous): R = -1.0
+      - invalid gaps (NaN): R = NaN
     """
     df = ri_prices.copy()
     name_col, isin_col = get_id_cols(df)
     month_cols = sort_month_cols(get_time_cols(df))
-    id_cols = [c for c in [name_col, isin_col] if c is not None]
+    id_cols_list = [c for c in [name_col, isin_col] if c is not None]
 
-    returns = df[id_cols].copy()
+    returns = df[id_cols_list].copy()
 
     for i, col in enumerate(month_cols):
         if i == 0:
@@ -179,15 +170,17 @@ def compute_monthly_returns(ri_prices: pd.DataFrame) -> pd.DataFrame:
             continue
 
         prev_col = month_cols[i - 1]
-        prev = pd.to_numeric(df[prev_col], errors="coerce").to_numpy(dtype=float)
-        curr = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        prev = df[prev_col].values.astype(float)
+        curr = df[col].values.astype(float)
 
         ret = np.full(len(df), np.nan)
 
+        # standard return: both valid and > 0
         valid = (~np.isnan(prev)) & (prev > 0) & (~np.isnan(curr)) & (curr > 0)
         ret[valid] = curr[valid] / prev[valid] - 1.0
 
-        delist = (~np.isnan(prev)) & (prev > 0) & (curr == 0.0)
+        # delisting: current == 0, previous was valid
+        delist = (curr == 0.0) & (~np.isnan(prev)) & (prev > 0)
         ret[delist] = -1.0
 
         returns[col] = ret
@@ -195,33 +188,42 @@ def compute_monthly_returns(ri_prices: pd.DataFrame) -> pd.DataFrame:
     return returns
 
 
-def build_stale_flags(
+def flag_stale_prices(
     returns_df: pd.DataFrame,
-    end_date: pd.Timestamp,
+    end_date: str,
     window_years: int = 10,
     threshold: float = 0.50
-) -> pd.DataFrame:
+):
     """
-    Compute stale-price diagnostics at a given year-end.
+    Flag firms with a proportion of zero returns exceeding `threshold`
+    over the `window_years`-year window ending at `end_date`.
+
+    NOTE:
+    This helper is kept for Section 2, where stale-price screening must be
+    applied year-by-year, not globally in cleaning.
     """
     _, isin_col = get_id_cols(returns_df)
     month_cols = sort_month_cols(get_time_cols(returns_df))
+
+    end_dt = pd.Timestamp(end_date)
+    start_dt = end_dt - pd.DateOffset(years=window_years)
+
+    # select columns within the trailing window
     col_dates = pd.to_datetime(month_cols, errors="coerce")
-
-    start_dt = end_date - pd.DateOffset(years=window_years)
-
     window_cols = [
         c for c, d in zip(month_cols, col_dates)
-        if pd.notna(d) and start_dt < d <= end_date
+        if pd.notna(d) and start_dt < d <= end_dt
     ]
 
     if not window_cols:
-        return pd.DataFrame(columns=["ISIN", "n_valid", "n_zero", "zero_frac", "stale_flag"])
+        return set(), pd.DataFrame()
 
     data = returns_df[window_cols].apply(pd.to_numeric, errors="coerce")
 
+    # count valid (non-NaN) observations and zero returns per firm
     n_valid = data.notna().sum(axis=1)
     n_zero = (data == 0.0).sum(axis=1)
+
     zero_frac = n_zero / n_valid.replace(0, np.nan)
 
     stale_info = pd.DataFrame({
@@ -230,17 +232,9 @@ def build_stale_flags(
         "n_zero": n_zero.values,
         "zero_frac": zero_frac.values,
     })
-    stale_info["stale_flag"] = stale_info["zero_frac"] > threshold
-    return stale_info
 
-
-def get_december_col(month_cols, year):
-    """
-    Return the December column for a given year, if available.
-    """
-    dts = pd.to_datetime(month_cols, errors="coerce")
-    candidates = [c for c, d in zip(month_cols, dts) if pd.notna(d) and d.year == year and d.month == 12]
-    return candidates[-1] if candidates else None
+    stale_isins = set(stale_info.loc[stale_info["zero_frac"] > threshold, "ISIN"])
+    return stale_isins, stale_info
 
 
 ####################################################################################
@@ -254,7 +248,7 @@ co2 = clean_headers(pd.read_csv(RAW_DIR / CO2_FILE))
 rev = clean_headers(pd.read_csv(RAW_DIR / REV_FILE))
 
 ####################################################################################
-# 4. A. RAW DATA CLEANING
+# 4. CLEAN STATIC
 ####################################################################################
 
 static_name_col, static_isin_col = get_id_cols(static)
@@ -264,64 +258,78 @@ if static_isin_col is None:
 if "Region" not in static.columns:
     raise ValueError("Static file must contain a 'Region' column.")
 
-# static universe: region only
+# remove missing ISIN
 static = static.dropna(subset=[static_isin_col]).copy()
+
+# keep only North America + Europe
 static = static[static["Region"].isin(REGIONS)].copy()
 
-# remove firms with fully empty timeseries rows
+# save intermediate static
+static.to_csv(CLEAN_DIR / "cleaned_static.csv", index=False)
+
+####################################################################################
+# 5. CLEAN EACH DATASET
+####################################################################################
+
 ri = drop_empty_timeseries_rows(ri)
 mv = drop_empty_timeseries_rows(mv)
 co2 = drop_empty_timeseries_rows(co2)
 rev = drop_empty_timeseries_rows(rev)
 
-# restrict all tables to region universe
+####################################################################################
+# 6. FILTER EACH DATASET TO STATIC UNIVERSE
+####################################################################################
+
 region_isins = set(static[static_isin_col])
+
 ri = keep_isins(ri, region_isins)
 mv = keep_isins(mv, region_isins)
 co2 = keep_isins(co2, region_isins)
 rev = keep_isins(rev, region_isins)
 
 ####################################################################################
-# 5. B. PRICE AND RETURN CLEANING
+# 7. CLEAN RI MONTHLY
 ####################################################################################
 
 ri_month_cols = sort_month_cols(get_time_cols(ri))
 ri[ri_month_cols] = ri[ri_month_cols].apply(pd.to_numeric, errors="coerce")
 
-# detect delistings first, so explicit delisting can become 0.0
+# detect delisting BEFORE low-price filter (delisted -> price = 0)
 ri = detect_delisting(ri)
 
-# treat RI < 0.5 as missing, but preserve exact 0.0 for delisting
+# treat low RI prices as missing (but keep 0.0 for delisted firms)
+# only mask prices that are < 0.5 AND > 0 (preserve exact 0.0 for delisting)
 for c in ri_month_cols:
     mask_low = (ri[c] < 0.5) & (ri[c] > 0)
     ri.loc[mask_low, c] = np.nan
 
-# drop rows that become entirely missing after low-price cleaning
+# after low-price cleaning, remove rows with all missing price history
 ri = ri.loc[~ri[ri_month_cols].isna().all(axis=1)].copy()
 
-# compute monthly simple returns
+# compute monthly simple returns (handles delisting = -100%)
 ri_ret = compute_monthly_returns(ri)
 
 ####################################################################################
-# 6. C. ANNUAL DATA CLEANING
+# 8. CLEAN MV MONTHLY
+####################################################################################
+
+mv_month_cols = sort_month_cols(get_time_cols(mv))
+mv[mv_month_cols] = mv[mv_month_cols].apply(pd.to_numeric, errors="coerce")
+
+####################################################################################
+# 9. CLEAN CO2 SCOPE 1 YEARLY
 ####################################################################################
 
 co2 = annual_forward_fill(co2)
-rev = annual_forward_fill(rev)
-
-# standardize annual column names as strings
-co2.columns = [str(c) for c in co2.columns]
-rev.columns = [str(c) for c in rev.columns]
-
-# forward-fill MV monthly mid-sample gaps (used for portfolio weighting)
-mv_month_cols = sort_month_cols(get_time_cols(mv))
-mv[mv_month_cols] = mv[mv_month_cols].apply(pd.to_numeric, errors="coerce")
-mv[mv_month_cols] = mv[mv_month_cols].ffill(axis=1)
 
 ####################################################################################
-# 7. D. BASE COMMON UNIVERSE
-# This is only the base cleaned universe across files.
-# Do NOT apply year-specific stale/missing-price filters globally here.
+# 10. CLEAN REVENUE YEARLY
+####################################################################################
+
+rev = annual_forward_fill(rev)
+
+####################################################################################
+# 11. BUILD COMMON ISIN UNIVERSE ACROSS ALL CLEANED FILES
 ####################################################################################
 
 _, ri_isin_col = get_id_cols(ri)
@@ -337,6 +345,11 @@ common_isins = (
     & set(rev[rev_isin_col])
 )
 
+# IMPORTANT:
+# Do NOT exclude stale-price firms globally here.
+# Stale-price screening must be applied year-by-year in Section 2.
+
+# keep only common universe everywhere
 static = keep_isins(static, common_isins)
 ri = keep_isins(ri, common_isins)
 ri_ret = keep_isins(ri_ret, common_isins)
@@ -345,89 +358,7 @@ co2 = keep_isins(co2, common_isins)
 rev = keep_isins(rev, common_isins)
 
 ####################################################################################
-# 8. E. YEAR-BY-YEAR INVESTABILITY / CLEANING DIAGNOSTICS
-#
-# These are NOT applied once globally.
-# They are computed at the end of each year Y for investing in Y+1.
-####################################################################################
-
-# prep references
-name_col, isin_col = get_id_cols(ri_ret)
-ri_month_cols = sort_month_cols(get_time_cols(ri_ret))
-co2_year_cols = sort_year_cols(get_time_cols(co2))
-
-# useful maps
-ri_prices_by_isin = ri.set_index(ri_isin_col)
-ri_rets_by_isin = ri_ret.set_index(ri_isin_col)
-co2_by_isin = co2.set_index(co2_isin_col)
-rev_by_isin = rev.set_index(rev_isin_col)
-
-screen_tables = []
-
-for year in range(START_SCREEN_YEAR, END_SCREEN_YEAR + 1):
-    dec_col = get_december_col(ri_month_cols, year)
-    if dec_col is None:
-        continue
-
-    stale_info = build_stale_flags(
-        returns_df=ri_ret,
-        end_date=pd.Timestamp(f"{year}-12-31"),
-        window_years=WINDOW_YEARS,
-        threshold=STALE_THRESHOLD
-    )
-
-    if stale_info.empty:
-        continue
-
-    stale_info = stale_info.set_index("ISIN")
-
-    screen_df = pd.DataFrame(index=sorted(common_isins))
-    screen_df.index.name = "ISIN"
-
-    # valid December price at end of year Y
-    dec_price = pd.to_numeric(ri_prices_by_isin[dec_col], errors="coerce")
-    screen_df["has_valid_dec_price"] = dec_price.notna()
-
-    # enough valid monthly returns over trailing 10y window
-    screen_df["n_valid_return_months"] = stale_info["n_valid"]
-    screen_df["has_min_history"] = screen_df["n_valid_return_months"] >= MIN_VALID_MONTHS
-
-    # stale price rule
-    screen_df["zero_return_fraction"] = stale_info["zero_frac"]
-    screen_df["stale_flag"] = stale_info["stale_flag"]
-
-    # carbon data available at end of year Y
-    year_str = str(year)
-    if year_str in co2_by_isin.columns:
-        screen_df["has_co2_at_year_end"] = pd.to_numeric(co2_by_isin[year_str], errors="coerce").notna()
-    else:
-        screen_df["has_co2_at_year_end"] = False
-
-    # revenue data available at end of year Y
-    if year_str in rev_by_isin.columns:
-        screen_df["has_rev_at_year_end"] = pd.to_numeric(rev_by_isin[year_str], errors="coerce").notna()
-    else:
-        screen_df["has_rev_at_year_end"] = False
-
-    # final investable flag for year Y+1
-    screen_df["investable_for_next_year"] = (
-        screen_df["has_valid_dec_price"]
-        & screen_df["has_min_history"]
-        & (~screen_df["stale_flag"])
-        & screen_df["has_co2_at_year_end"]
-        & screen_df["has_rev_at_year_end"]
-    )
-
-    screen_df = screen_df.reset_index()
-    screen_df["screen_year"] = year
-    screen_df["investment_year"] = year + 1
-
-    screen_tables.append(screen_df)
-
-screen_results = pd.concat(screen_tables, ignore_index=True) if screen_tables else pd.DataFrame()
-
-####################################################################################
-# 9. OPTIONAL: SORT CLEANED FILES
+# 12. OPTIONAL: SORT ALL FILES BY ISIN
 ####################################################################################
 
 static = static.sort_values(static_isin_col).reset_index(drop=True)
@@ -438,7 +369,7 @@ co2 = co2.sort_values(co2_isin_col).reset_index(drop=True)
 rev = rev.sort_values(rev_isin_col).reset_index(drop=True)
 
 ####################################################################################
-# 10. SAVE CLEANED OUTPUTS
+# 13. SAVE CLEANED OUTPUTS
 ####################################################################################
 
 static.to_csv(CLEAN_DIR / "cleaned_static.csv", index=False)
@@ -448,15 +379,12 @@ mv.to_csv(CLEAN_DIR / "cleaned_MV_monthly.csv", index=False)
 co2.to_csv(CLEAN_DIR / "cleaned_CO2_scope1_yearly.csv", index=False)
 rev.to_csv(CLEAN_DIR / "cleaned_REV_yearly.csv", index=False)
 
-# diagnostics / year-specific screens
-screen_results.to_csv(CLEAN_DIR / "investment_set_screens_by_year.csv", index=False)
-
 ####################################################################################
-# 11. PRINT SUMMARY
+# 14. PRINT SUMMARY
 ####################################################################################
 
-print("Data cleaning / pre-processing complete.")
-print(f"Base common universe size: {len(common_isins)} firms")
+print("Data cleaning complete.")
+print(f"Common universe size: {len(common_isins)} firms")
 print("Files saved in:", CLEAN_DIR)
 print("- cleaned_static.csv")
 print("- cleaned_RI_monthly_prices.csv")
@@ -464,13 +392,5 @@ print("- cleaned_RI_monthly_returns.csv")
 print("- cleaned_MV_monthly.csv")
 print("- cleaned_CO2_scope1_yearly.csv")
 print("- cleaned_REV_yearly.csv")
-print("- investment_set_screens_by_year.csv")
-
-if not screen_results.empty:
-    summary_by_year = (
-        screen_results.groupby("screen_year")["investable_for_next_year"]
-        .sum()
-        .rename("n_investable")
-    )
-    print("\nInvestable firms by year-end screen:")
-    print(summary_by_year)
+print("\nNote: stale-price screening is NOT applied globally in cleaning.")
+print("It should be applied year-by-year in Section 2.")
