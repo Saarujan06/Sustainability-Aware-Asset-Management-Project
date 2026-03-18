@@ -14,6 +14,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parent
 CLEAN_DIR = BASE_DIR / "cleaned_data"
 OUT_DIR = BASE_DIR / "investment_set_output"
+MOMENTS_DIR = OUT_DIR / "moments_by_year"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 ####################################################################################
@@ -25,10 +26,14 @@ END_YEAR = 2024
 WINDOW_YEARS = 10
 MIN_VALID_MONTHS = 36
 STALE_THRESHOLD = 0.50
+SAVE_DEBUG_MOMENTS = False
 
 RI_PRICES_FILE = "cleaned_RI_monthly_prices.csv"
 RI_RETURNS_FILE = "cleaned_RI_monthly_returns.csv"
 CO2_FILE = "cleaned_CO2_scope1_yearly.csv"
+
+if SAVE_DEBUG_MOMENTS:
+    MOMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 ####################################################################################
 # 2. HELPERS
@@ -78,6 +83,16 @@ def get_december_col(month_cols, year):
     return candidates[-1] if candidates else None
 
 
+def get_trailing_window_cols(month_cols, end_date: str, window_years: int):
+    end_dt = pd.Timestamp(end_date)
+    start_dt = end_dt - pd.DateOffset(years=window_years)
+    col_dates = pd.to_datetime(month_cols, errors="coerce")
+    return [
+        c for c, d in zip(month_cols, col_dates)
+        if pd.notna(d) and start_dt < d <= end_dt
+    ]
+
+
 def flag_stale_prices(
     returns_df: pd.DataFrame,
     end_date: str,
@@ -89,15 +104,7 @@ def flag_stale_prices(
     """
     _, isin_col = get_id_cols(returns_df)
     month_cols = sort_month_cols(get_time_cols(returns_df))
-
-    end_dt = pd.Timestamp(end_date)
-    start_dt = end_dt - pd.DateOffset(years=window_years)
-
-    col_dates = pd.to_datetime(month_cols, errors="coerce")
-    window_cols = [
-        c for c, d in zip(month_cols, col_dates)
-        if pd.notna(d) and start_dt < d <= end_dt
-    ]
+    window_cols = get_trailing_window_cols(month_cols, end_date=end_date, window_years=window_years)
 
     if not window_cols:
         return pd.DataFrame(columns=["ISIN", "n_valid", "n_zero", "zero_frac", "stale_flag"])
@@ -141,6 +148,7 @@ _, co2_isin_col = get_id_cols(co2)
 ri_month_cols = sort_month_cols(get_time_cols(ri_prices))
 
 ri_prices_by_isin = ri_prices.set_index(ri_price_isin_col)
+ri_returns_by_isin = ri_returns.set_index(ri_ret_isin_col)
 co2_by_isin = co2.set_index(co2_isin_col)
 
 all_isins = sorted(set(ri_prices_by_isin.index) & set(ri_returns[ri_ret_isin_col]) & set(co2_by_isin.index))
@@ -150,6 +158,7 @@ all_isins = sorted(set(ri_prices_by_isin.index) & set(ri_returns[ri_ret_isin_col
 ####################################################################################
 
 investment_tables = []
+moments_summary_rows = []
 
 for year in range(START_YEAR, END_YEAR + 1):
     dec_col = get_december_col(ri_month_cols, year)
@@ -206,6 +215,68 @@ for year in range(START_YEAR, END_YEAR + 1):
 
     investment_tables.append(screen_df)
 
+    # 5.1 Compute expected returns and covariance for investable firms (end of year Y)
+    window_cols = get_trailing_window_cols(
+        ri_month_cols,
+        end_date=f"{year}-12-31",
+        window_years=WINDOW_YEARS,
+    )
+
+    investable_isins = screen_df.loc[screen_df["investable_for_next_year"], "ISIN"].tolist()
+
+    if (not window_cols) or (not investable_isins):
+        moments_summary_rows.append({
+            "screen_year": year,
+            "investment_year": year + 1,
+            "n_window_months": len(window_cols),
+            "n_investable": len(investable_isins),
+            "n_assets_in_mu": 0,
+            "n_assets_in_cov": 0,
+            "n_assets_dropped_missing": len(investable_isins),
+        })
+        continue
+
+    returns_window = ri_returns_by_isin.reindex(investable_isins)[window_cols].apply(pd.to_numeric, errors="coerce")
+    returns_window_t = returns_window.T
+
+    # Enforce the PDF formula with fixed tau=120 by keeping only assets with complete data.
+    complete_assets = returns_window_t.columns[returns_window_t.notna().all(axis=0)]
+    returns_complete = returns_window_t[complete_assets]
+
+    if returns_complete.empty:
+        moments_summary_rows.append({
+            "screen_year": year,
+            "investment_year": year + 1,
+            "n_window_months": len(window_cols),
+            "n_investable": len(investable_isins),
+            "n_assets_in_mu": 0,
+            "n_assets_in_cov": 0,
+            "n_assets_dropped_missing": len(investable_isins),
+        })
+        continue
+
+    tau = float(returns_complete.shape[0])
+    mu = returns_complete.sum(axis=0) / tau
+    mu_df = mu.rename("mu_monthly").reset_index().rename(columns={"index": "ISIN"})
+    if SAVE_DEBUG_MOMENTS:
+        mu_df.to_csv(MOMENTS_DIR / f"mu_{year}.csv", index=False)
+
+    # Covariance matrix with exact 1/tau scaling from the PDF formula.
+    centered = returns_complete - mu
+    cov = (centered.T @ centered) / tau
+    if SAVE_DEBUG_MOMENTS:
+        cov.to_csv(MOMENTS_DIR / f"cov_{year}.csv", index=True)
+
+    moments_summary_rows.append({
+        "screen_year": year,
+        "investment_year": year + 1,
+        "n_window_months": len(window_cols),
+        "n_investable": len(investable_isins),
+        "n_assets_in_mu": int(len(complete_assets)),
+        "n_assets_in_cov": int(cov.shape[0]),
+        "n_assets_dropped_missing": int(len(investable_isins) - len(complete_assets)),
+    })
+
 investment_set_df = pd.concat(investment_tables, ignore_index=True) if investment_tables else pd.DataFrame()
 
 ####################################################################################
@@ -222,6 +293,9 @@ summary_by_year = (
 
 summary_by_year.to_csv(OUT_DIR / "investment_set_summary_by_year.csv")
 
+moments_summary_df = pd.DataFrame(moments_summary_rows)
+moments_summary_df.to_csv(OUT_DIR / "moments_summary_by_year.csv", index=False)
+
 ####################################################################################
 # 7. PRINT SUMMARY
 ####################################################################################
@@ -230,5 +304,12 @@ print("Section 2.1 complete.")
 print("Files saved in:", OUT_DIR)
 print("- investment_set_by_year.csv")
 print("- investment_set_summary_by_year.csv")
+print("- moments_summary_by_year.csv")
+if SAVE_DEBUG_MOMENTS:
+    print("Per-year moments saved in:", MOMENTS_DIR)
+    print("- mu_<screen_year>.csv")
+    print("- cov_<screen_year>.csv")
+else:
+    print("Per-year moments files are disabled (SAVE_DEBUG_MOMENTS=False).")
 print("\nNumber of investable firms by year:")
 print(summary_by_year)
