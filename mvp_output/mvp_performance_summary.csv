@@ -1,2 +1,2 @@
-portfolio,start_date,end_date,n_months,ann_mean_return,ann_volatility,sharpe_ratio,min_monthly_ret,max_monthly_ret
-MVP_long_only_OOS,2014-01,2025-12,144,0.06062720536560569,0.11927256955915061,0.3601648000147535,-0.12474920322825389,0.11104857823972625
+portfolio,start_date,end_date,n_months,ann_mean_return,ann_volatility,sharpe_ratio,min_monthly_return,max_monthly_return
+MVP_long_only_OOS,2014-01,2025-12,144,0.060496985862768374,0.12270871213124189,0.49301296388853316,-0.14559504797891473,0.1200460051842125
