@@ -456,3 +456,151 @@ print(f"Max monthly return    : {ret_max * 100:.2f}%")
 
 print("\nSaved:")
 print("- mvp_performance_summary.csv")
+
+####################################################################################
+# SECTION 2.3 - VALUE-WEIGHTED BENCHMARK
+####################################################################################
+
+MV_FILE = "cleaned_MV_monthly.csv"
+
+# Load cleaned monthly market caps
+mv = clean_headers(pd.read_csv(CLEAN_DIR / MV_FILE))
+_, mv_isin_col = get_id_cols(mv)
+mv_month_cols = sort_month_cols(get_time_cols(mv))
+mv_by_isin = mv.set_index(mv_isin_col)
+
+vw_rows = []
+
+for year in range(START_YEAR, END_YEAR + 1):
+    investment_year = year + 1
+
+    investable_isins = investment_set.loc[
+        (investment_set["screen_year"] == year)
+        & (investment_set["investable_for_next_year"] == True),
+        "ISIN"
+    ].tolist()
+
+    if len(investable_isins) == 0:
+        print(f"{year}: no investable firms for VW")
+        continue
+
+    inv_cols = get_investment_year_cols(ret_month_cols, investment_year)
+    if len(inv_cols) == 0:
+        print(f"{year}: no investment-year columns for VW")
+        continue
+
+    for col in inv_cols:
+        current_dt = pd.Timestamp(col)
+        prev_month_dt = current_dt - pd.DateOffset(months=1)
+
+        prev_candidates = [c for c in mv_month_cols if pd.Timestamp(c) == prev_month_dt]
+        if len(prev_candidates) == 0:
+            continue
+
+        prev_col = prev_candidates[0]
+
+        caps = (
+            mv_by_isin.reindex(investable_isins)[prev_col]
+            .apply(pd.to_numeric, errors="coerce")
+        )
+
+        rets = (
+            ri_ret_by_isin.reindex(investable_isins)[col]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+        )
+
+        valid_mask = caps.notna() & (caps > 0)
+        caps = caps[valid_mask]
+        rets = rets[valid_mask]
+
+        if len(caps) == 0:
+            continue
+
+        weights_vw = caps / caps.sum()
+        rp_vw = float((weights_vw * rets).sum())
+
+        vw_rows.append({
+            "screen_year": year,
+            "investment_year": investment_year,
+            "date": current_dt,
+            "Rp_vw": rp_vw
+        })
+
+    print(f"{year}: computed VW returns for {investment_year}")
+
+vw_monthly_returns = pd.DataFrame(vw_rows)
+
+if vw_monthly_returns.empty:
+    raise RuntimeError("No value-weighted returns were generated.")
+
+vw_monthly_returns = vw_monthly_returns.sort_values("date").reset_index(drop=True)
+vw_monthly_returns.to_csv(OUT_DIR / "vw_monthly_returns.csv", index=False)
+
+print("\nSection 2.3 Block 1 complete.")
+print("- vw_monthly_returns.csv")
+
+####################################################################################
+# COMPARE MVP VS VALUE-WEIGHTED
+####################################################################################
+
+mvp_compare = mvp_monthly_returns[["date", "Rp_mvp"]].copy()
+vw_compare = vw_monthly_returns[["date", "Rp_vw"]].copy()
+
+mvp_compare["date"] = pd.to_datetime(mvp_compare["date"])
+vw_compare["date"] = pd.to_datetime(vw_compare["date"])
+
+compare_df = pd.merge(mvp_compare, vw_compare, on="date", how="inner").sort_values("date")
+compare_df = compare_df.set_index("date")
+
+if compare_df.empty:
+    raise RuntimeError("Merged comparison dataframe is empty.")
+
+def summary_stats(series: pd.Series, name: str) -> dict:
+    ann = 12
+    vals = series.to_numpy(dtype=float)
+
+    mu_ann = vals.mean() * ann
+    vol_ann = vals.std(ddof=1) * np.sqrt(ann)
+    sr = np.nan if vals.std(ddof=1) == 0 else (vals.mean() / vals.std(ddof=1)) * np.sqrt(ann)
+
+    return {
+        "portfolio": name,
+        "start_date": series.index.min().strftime("%Y-%m"),
+        "end_date": series.index.max().strftime("%Y-%m"),
+        "n_months": len(vals),
+        "ann_mean_return": mu_ann,
+        "ann_volatility": vol_ann,
+        "sharpe_ratio": sr,
+        "min_monthly_return": vals.min(),
+        "max_monthly_return": vals.max()
+    }
+
+mvp_stats = summary_stats(compare_df["Rp_mvp"], "MVP_long_only_OOS")
+vw_stats = summary_stats(compare_df["Rp_vw"], "VW_benchmark")
+
+comparison_summary = pd.DataFrame([mvp_stats, vw_stats])
+comparison_summary.to_csv(OUT_DIR / "mvp_vs_vw_performance_summary.csv", index=False)
+
+# Cumulative returns (saved instead of plotted)
+compare_df["cum_mvp"] = (1.0 + compare_df["Rp_mvp"]).cumprod() - 1.0
+compare_df["cum_vw"] = (1.0 + compare_df["Rp_vw"]).cumprod() - 1.0
+
+compare_df.to_csv(OUT_DIR / "mvp_vs_vw_monthly_comparison.csv", index=True)
+compare_df[["cum_mvp", "cum_vw"]].to_csv(
+    OUT_DIR / "mvp_vs_vw_cumulative_returns.csv", index=True
+)
+
+####################################################################################
+# PRINT SUMMARY
+####################################################################################
+
+print("\n" + "=" * 60)
+print("MVP VS VALUE-WEIGHTED BENCHMARK")
+print("=" * 60)
+print(comparison_summary.to_string(index=False))
+
+print("\nSaved:")
+print("- mvp_vs_vw_performance_summary.csv")
+print("- mvp_vs_vw_monthly_comparison.csv")
+print("- mvp_vs_vw_cumulative_returns.csv")
