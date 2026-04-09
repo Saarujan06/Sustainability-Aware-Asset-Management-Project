@@ -1,4 +1,4 @@
-screen_year,ISIN,investable,investment_year
+screen_year,ISIN,investable_for_next_year,investment_year
 2013,AN8068571086,True,2014
 2013,AT000000STR1,False,2014
 2013,AT00000VIE62,False,2014
