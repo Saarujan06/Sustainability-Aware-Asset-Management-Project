@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\zagor\\\\Vlad\\\\M\\\\Sustainability\" -Recurse -Force)",
+      "Bash(Select-Object FullName, PSIsContainer)",
+      "Bash(Sort-Object FullName)",
+      "Bash(Format-List)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\zagor\\\\Vlad\\\\M\\\\Sustainability\" -Recurse -Force | Select-Object FullName, @{Name=\"Type\";Expression={if\\($_.PSIsContainer\\){\"Folder\"}else{\"File\"}}} | Sort-Object FullName)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\zagor\\\\Vlad\\\\M\\\\Sustainability\" -Directory | ForEach-Object { $_.Name })"
+    ]
+  }
+}
