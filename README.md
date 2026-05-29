@@ -70,12 +70,12 @@ executed in order, top to bottom.
 
 | Notebook section | Spec ref | What it builds |
 |---|---|---|
-| §1 Imports & config         | —        | Constants: `REGIONS=["AMER","EUR"]`, `START_YEAR=2013`, `END_YEAR=2024`, `WINDOW_YEARS=10`, `STALE_THRESHOLD=0.50`, `MIN_VALID_MONTHS=120`, `COV_METHOD="ledoit_wolf"`. |
-| §2 Data cleaning            | §2.1     | Loads raw `Data_2026/*.xlsx`, drops empty rows, detects delistings, screens by region, computes monthly simple returns, writes `cleaned_data/*.csv`. |
+| §1 Imports & config         | §0        | Constants: `REGIONS=["AMER","EUR"]`, `START_YEAR=2013`, `END_YEAR=2024`, `WINDOW_YEARS=10`, `STALE_THRESHOLD=0.50`, `MIN_VALID_MONTHS=120`, `COV_METHOD="ledoit_wolf"`. |
+| §2 Data cleaning            | §1     | Loads raw `Data_2026/*.xlsx`, drops empty rows, detects delistings, screens by region, computes monthly simple returns, writes `cleaned_data/*.csv`. |
 | §3 Investment set           | §2.1     | For each screen year Y, marks firms `investable_for_next_year` (≥36 valid months in trailing 10y, monthly stale share < 50%, non-missing Y-end Cap and Scope 1 + Revenue). |
 | §4 Minimum-variance portfolio | §2.2   | Annual rebalance + monthly drift. Covariance estimated via Ledoit–Wolf shrinkage on the 120-month complete-case subset. Outputs `mvp_*.csv`. |
 | §5 VW benchmark             | §2.3     | Monthly-rebalanced VW over the investable set. Outputs `vw_monthly_returns.csv`. |
-| §6 MVP vs VW                | §2.4     | Out-of-sample performance comparison. Outputs `mvp_vs_vw_*.csv`, `cumulative_returns_plot.png`. |
+| §6 MVP vs VW                | §2.3     | Out-of-sample performance comparison. Outputs `mvp_vs_vw_*.csv`, `cumulative_returns_plot.png`. |
 | §7 Covariance robustness    | §2.4     | Reruns the MVP under sample, single-factor, and Ledoit–Wolf covariance. Outputs `robustness_*.csv/png`. |
 | §8 Carbon emissions (§3.1)  | §3.1     | WACI and CF of P(mv) and P(vw). Top-10 contributor tables. |
 | §9 P(mv)_oos(0.5)            | §3.2     | CF-constrained MVP: `cf_limit = 0.5 × CF_MVP`. Outputs `mvp05_*.csv`. |
